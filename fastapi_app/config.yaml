@@ -1,0 +1,2 @@
+default_model: buffalo_l
+database_url: sqlite+aiosqlite:///./faces.db
