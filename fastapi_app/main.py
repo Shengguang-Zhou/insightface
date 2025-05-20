@@ -1,20 +1,30 @@
 from fastapi import FastAPI, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 import numpy as np
+import asyncio
 
 from .database import get_db
 from .models import Base, Face
 from .face import model_manager
+from .face import SUPPORTED_MODELS
 from .schemas import (
     MatchRequest,
     RecognizeRequest,
     CameraBatchRequest,
+    RegisterRequest,
+    RegisterResponse,
     MatchResponse,
     RecognizeResponse,
     CameraResponse,
 )
 
 app = FastAPI(title="InsightFace API")
+
+
+@app.get("/models", response_model=list[str])
+async def list_models():
+    """Return built-in model pack names."""
+    return SUPPORTED_MODELS
 
 @app.on_event("startup")
 async def on_startup():
@@ -23,23 +33,35 @@ async def on_startup():
 
 @app.post("/match", response_model=MatchResponse)
 async def match_faces(req: MatchRequest):
-    model = await model_manager.get_model(req.model)
-    img1 = model.get(req.image1)
-    img2 = model.get(req.image2)
-    if not img1.faces or not img2.faces:
+    img1 = await model_manager.get_faces(req.image1, req.model)
+    img2 = await model_manager.get_faces(req.image2, req.model)
+    if not img1 or not img2:
         return MatchResponse(similarity=0.0)
-    emb1 = img1.faces[0].normed_embedding
-    emb2 = img2.faces[0].normed_embedding
+    emb1 = img1[0].normed_embedding
+    emb2 = img2[0].normed_embedding
     sim = float(np.dot(emb1, emb2))
     return MatchResponse(similarity=sim)
 
+
+@app.post("/register", response_model=RegisterResponse)
+async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    """Register a new face in the database."""
+    faces = await model_manager.get_faces(req.image, req.model)
+    if not faces:
+        return RegisterResponse(id=-1, name=req.name)
+    emb = faces[0].normed_embedding.tobytes()
+    face = Face(name=req.name, embedding=emb)
+    db.add(face)
+    await db.commit()
+    await db.refresh(face)
+    return RegisterResponse(id=face.id, name=face.name)
+
 @app.post("/recognize", response_model=RecognizeResponse)
 async def recognize(req: RecognizeRequest, db: AsyncSession = Depends(get_db)):
-    model = await model_manager.get_model(req.model)
-    img = model.get(req.image)
-    if not img.faces:
+    faces = await model_manager.get_faces(req.image, req.model)
+    if not faces:
         return RecognizeResponse(name=None, distance=None)
-    emb = img.faces[0].normed_embedding.tobytes()
+    emb = faces[0].normed_embedding.tobytes()
     result = await db.execute(
         "SELECT name, embedding FROM faces"
     )
@@ -47,7 +69,7 @@ async def recognize(req: RecognizeRequest, db: AsyncSession = Depends(get_db)):
     best_dist = 1e9
     for name, emb_db in result:
         emb_db = np.frombuffer(emb_db, dtype=np.float32)
-        dist = np.linalg.norm(emb_db - img.faces[0].normed_embedding)
+        dist = np.linalg.norm(emb_db - faces[0].normed_embedding)
         if dist < best_dist:
             best_dist = dist
             best_name = name
@@ -57,11 +79,14 @@ async def recognize(req: RecognizeRequest, db: AsyncSession = Depends(get_db)):
 
 @app.post("/process", response_model=list[CameraResponse])
 async def process(req: CameraBatchRequest, db: AsyncSession = Depends(get_db)):
-    responses = []
-    for cam in req.cameras:
-        rec = await recognize(RecognizeRequest(image=cam.image, model=cam.model), db)
-        responses.append(CameraResponse(camera_id=cam.camera_id, result=rec))
-    return responses
+    async def handle_camera(cam):
+        rec = await recognize(
+            RecognizeRequest(image=cam.image, model=cam.model), db
+        )
+        return CameraResponse(camera_id=cam.camera_id, rtsp=cam.rtsp, result=rec)
+
+    tasks = [handle_camera(cam) for cam in req.cameras]
+    return await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     import uvicorn

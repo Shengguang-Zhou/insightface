@@ -1,2 +1,4 @@
 default_model: buffalo_l
 database_url: sqlite+aiosqlite:///./faces.db
+ctx_id: 0
+det_size: [640, 640]
